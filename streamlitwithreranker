@@ -21,7 +21,7 @@ CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
 EMBED_MODEL = "@cf/baai/bge-m3" 
 EMBED_DIM = 1024 
 
-RERANK_MODEL = "Custom Gemini Reranker" # ⬅️ تغییر نام برای نمایش
+RERANK_MODEL = "Custom Gemini Reranker" 
 GEMINI_MODEL = "gemini-2.5-flash" 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 
