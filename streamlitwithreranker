@@ -1,0 +1,443 @@
+import os
+import sys
+import httpx 
+import re 
+from typing import List, Dict, Any, Optional
+from dotenv import load_dotenv, find_dotenv
+import streamlit as st
+from supabase.client import create_client, Client
+from datetime import datetime
+
+# ---------------- Streamlit Configuration (MUST BE FIRST COMMAND) ----------------
+st.set_page_config(page_title="Custom Gemini Rerank Chatbot", layout="wide")
+
+# ---------------- ENV & CONFIG ----------------
+load_dotenv(find_dotenv(), override=True)
+
+
+CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN") 
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID") 
+
+EMBED_MODEL = "@cf/baai/bge-m3" 
+EMBED_DIM = 1024 
+
+RERANK_MODEL = "Custom Gemini Reranker" # ⬅️ تغییر نام برای نمایش
+GEMINI_MODEL = "gemini-2.5-flash" 
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+
+# 🚨 تنظیمات Custom Reranking
+TOP_K_RETRIEVAL = 10  # ⬅️ بازیابی 10 چانک اولیه برای رتبه‌بندی بهتر توسط Gemini
+TOP_K_RERANK = 5      # چانک‌های نهایی که به LLM می‌رسند
+
+if not all([GOOGLE_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_KEY, CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID]):
+    st.error("❌ تنظیمات ناقص: کلیدهای API (Google/Cloudflare) و Supabase را در فایل .env تنظیم کنید.")
+    
+# Initialize Supabase 
+supabase = None
+if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+    try:
+        supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    except Exception as e:
+        st.error(f"❌ خطای اتصال به Supabase: {e}")
+
+# ---------------- CLOUDFLARE EMBEDDING CLIENT ----------------
+
+class CloudflareBaseClient:
+    def __init__(self, api_token: str, account_id: str):
+        self.api_url_base = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run"
+        self.headers = {
+            "Authorization": f"Bearer {api_token}",
+            "Content-Type": "application/json"
+        }
+        self.client = httpx.Client(timeout=180) 
+
+class CloudflareEmbedClient(CloudflareBaseClient):
+    """کلاینت Embedding برای Cloudflare BGE-M3 (1024 Dim)."""
+    
+    def __init__(self, api_token: str, account_id: str):
+        super().__init__(api_token, account_id)
+        self.model = EMBED_MODEL
+        self.dim = EMBED_DIM 
+        self.api_url = f"{self.api_url_base}/{self.model}"
+
+    def embed(self, text: str) -> List[float]:
+        payload = {"text": [f"query: {text}"]}
+        
+        try:
+            response = self.client.post(self.api_url, headers=self.headers, json=payload)
+            response.raise_for_status() 
+            
+            data = response.json()
+            vector = data.get("result", {}).get("data", [[]])[0]
+            
+            if not vector or len(vector) != self.dim:
+                return [0.0] * self.dim
+            
+            return vector
+                
+        except Exception as e:
+            st.error(f"❌ General Embed API Error: {e}")
+            return [0.0] * self.dim
+
+
+# ---------------- LLM Client (Gemini Generation) ----------------
+
+class GeminiClient:
+    GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com"
+    
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.model = GEMINI_MODEL 
+        self.api_path = f"{self.GEMINI_API_BASE_URL}/v1beta/models/{self.model}:generateContent"
+        self.full_url = self.api_path 
+        self.headers = {"Content-Type": "application/json"}
+        self.client = httpx.Client(timeout=180)
+
+    def generate(self, system_prompt: str, history: List[Dict[str, str]], user_prompt: str) -> str:
+        
+        if not self.api_key:
+             return "خطا: کلید GOOGLE_API_KEY تنظیم نشده است."
+             
+        # ... (منطق تبدیل تاریخچه به فرمت Gemini) ...
+        api_history = []
+        for msg in history:
+            role = "user" if msg["role"] == "user" else "model"
+            if msg.get("content"):
+                api_history.append({"role": role, "parts": [{"text": msg["content"]}]})
+
+        contents = [
+            {"role": "user", "parts": [{"text": system_prompt}]},
+            {"role": "model", "parts": [{"text": "باشه، درک شد."}]}
+        ]
+        
+        # اگر تاریخچه مکالمه وجود داشته باشد، آن را اضافه می‌کنیم
+        if api_history:
+             # تاریخچه مکالمه واقعی را اضافه می‌کنیم (از پیام دوم به بعد اگر اولین پیام دستیار است)
+            contents.extend(api_history[1:]) 
+        
+        contents.append({"role": "user", "parts": [{"text": user_prompt}]})
+        
+        payload = {"contents": contents}
+        params = {"key": self.api_key} 
+
+        try:
+            r = self.client.post(self.full_url, headers=self.headers, json=payload, params=params)
+            
+            if not r.is_success:
+                msg = r.json().get("error", {}).get("message", r.text)
+                st.error(f"Gemini API Error {r.status_code}: {msg}")
+                return "خطا در برقراری ارتباط با مدل Gemini. (لطفاً GOOGLE_API_KEY را چک کنید)"
+                
+            data = r.json()
+            # 🚨 بررسی خطاهای احتمالی از طرف LLM (مثلاً Blocked by safety settings)
+            if 'candidates' not in data or not data['candidates']:
+                return "خطا: Gemini پاسخی برنگرداند یا محتوا توسط تنظیمات ایمنی بلاک شده است."
+                
+            return data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "") or "No response."
+        except Exception as e:
+            st.error(f"LLM Connection Error: {e}")
+            return "خطای شبکه یا اتصال به Gemini."
+
+
+# ---------------- CLIENT INITIALIZATION ----------------
+
+@st.cache_resource
+def get_clients():
+    """ایجاد یکبارۀ کلاینت‌های Cloudflare Embed و Gemini."""
+    if not CLOUDFLARE_API_TOKEN or not CLOUDFLARE_ACCOUNT_ID:
+        st.error("❌ Cloudflare API keys are missing. Embedding is disabled.")
+        embed_client = None
+    else:
+        embed_client = CloudflareEmbedClient(CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID)
+        
+    gemini_client = GeminiClient(GOOGLE_API_KEY)
+    
+    st.success("✅ Clients Initialized (Cloudflare Embed & Gemini LLM/Reranker).", icon="🧠")
+    return embed_client, gemini_client
+
+# 🚨 فراخوانی کلاینت‌ها برای استفاده در سطح ماژول
+cloudflare_embed_service, gemini_service = get_clients()
+
+
+# ---------------- CUSTOM RERANKING FUNCTION (Gemini-based) ----------------
+
+def custom_rerank_with_gemini(query: str, documents: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+    """
+    استفاده از Gemini 2.5 Flash برای انتخاب top_k چانک مرتبط
+    از لیست retrieved_chunks (با یک فراخوانی LLM).
+    """
+    if gemini_service is None:
+        st.error("❌ Gemini service not initialized for custom reranking.")
+        return documents[:top_k]
+
+    # 1. ساخت لیست چانک‌ها برای LLM
+    numbered_chunks = []
+    for i, doc in enumerate(documents):
+        # شماره‌گذاری چانک‌ها برای بازگشت به ایندکس اصلی
+        content = doc.get('content', '').replace('\n', ' ').strip()
+        # 🚨 فقط 700 کاراکتر اول را برای پرامپت می‌فرستیم تا توکن کمتری مصرف شود
+        numbered_chunks.append(f"[Chunk {i+1}]: {content[:700]}...") 
+
+    chunks_list = "\n---\n".join(numbered_chunks)
+
+    # 2. پرامپت دهی به Gemini برای انتخاب و مرتب‌سازی
+    rerank_prompt = (
+        "شما یک رتبه‌بندی‌کننده (Reranker) متخصص هستید. وظیفه شما این است که از لیست چانک‌های "
+        f"ارائه شده در زیر، **{top_k}** مورد را که **بیشترین ارتباط معنایی و بالاترین کیفیت اطلاعات** را با سؤال کاربر دارند، "
+        "انتخاب کنید. هنگام رتبه‌بندی، این معیارها را به ترتیب اولویت رعایت کنید:\n"
+        "1. **ارتباط مستقیم:** چانکی را انتخاب کنید که شامل پاسخ مستقیم به سؤال باشد، نه فقط کلمات کلیدی مشترک.\n"
+        "2. **جامعیت:** چانکی را انتخاب کنید که کامل‌ترین اطلاعات را در مورد موضوع سؤال ارائه دهد.\n"
+        "3. **تکرارزدایی:** از انتخاب چانک‌هایی که محتوای مشابه یا تکراری دارند خودداری کنید و چانک‌های منحصربه‌فرد را ترجیح دهید.\n"
+        "4. **کیفیت:** چانک‌هایی که جملات کامل و ساختار واضحی دارند را بالاتر رتبه‌بندی کنید."
+        "\n\n**پاسخ شما باید فقط شامل شماره‌های چانک‌های انتخابی (به ترتیب رتبه بالاتر به پایین‌تر)، "
+        "با کاما (,) جدا شده باشد. هیچ متن یا توضیحی اضافه نکنید.**"
+        "\n\n**سؤال کاربر:**\n"
+        f"'{query}'"
+        "\n\n**لیست چانک‌ها برای رتبه‌بندی:**\n"
+        f"{chunks_list}"
+        "\n\n**پاسخ (فقط شماره چانک‌ها):**"
+    )
+    
+    try:
+        selection_text = gemini_service.generate(
+            system_prompt="شما یک ابزار رتبه‌بندی هستید و فقط شماره‌ها را برمی‌گردانید.",
+            history=[], 
+            user_prompt=rerank_prompt
+        )
+        
+        # 3. پردازش خروجی LLM
+        # خروجی تمیز شده (فقط اعداد و کاما)
+        selected_indices_str = re.findall(r'(\d+)', selection_text)
+        
+        if not selected_indices_str:
+            st.warning(f"⚠️ Custom Reranker failed to extract numbers. LLM output: {selection_text[:100]}... Falling back to Similarity.")
+            # اگر LLM نتوانست اعداد را استخراج کند، بر اساس Similarity اولیه برمی‌گردانیم
+            documents.sort(key=lambda x: x.get('similarity', 0.0), reverse=True)
+            return documents[:top_k]
+            
+        selected_indices = []
+        
+        # 4. بازسازی لیست نهایی بر اساس ترتیب Gemini
+        for i_str in selected_indices_str:
+            index = int(i_str) - 1 # تبدیل "1" به ایندکس 0
+            # مطمئن می‌شویم که ایندکس در محدوده مجاز است و تکراری نیست
+            if 0 <= index < len(documents) and documents[index] not in selected_indices:
+                 selected_indices.append(documents[index])
+
+        # 5. اطمینان از اینکه لیست نهایی top_k است
+        final_ranked_chunks = selected_indices[:top_k]
+        
+        st.info(f"✅ Custom Reranking with Gemini completed. Selected chunks count: {len(final_ranked_chunks)}", icon="🧠")
+        return final_ranked_chunks
+        
+    except Exception as e:
+        st.error(f"❌ Custom Gemini Rerank Error: {e}. Falling back to Similarity.")
+        # اگر هر خطایی رخ داد، بر اساس Similarity اولیه برمی‌گردانیم
+        documents.sort(key=lambda x: x.get('similarity', 0.0), reverse=True)
+        return documents[:top_k]
+
+
+# ---------------- RAG LOGIC ----------------
+
+def retrieve_rag_context(query: str) -> str:
+    """بازیابی زمینه RAG را انجام می‌دهد و Custom Reranking را اعمال می‌کند."""
+    
+    match_count = TOP_K_RETRIEVAL 
+    
+    if cloudflare_embed_service is None or supabase is None:
+        return "RAG disabled: Cloudflare Embed Client or Supabase initialization failed."
+        
+    try:
+        # 1. تولید Embedding کوئری (1024 بُعد)
+        qvec = cloudflare_embed_service.embed(query)
+        
+        current_dim = cloudflare_embed_service.dim 
+        if not qvec or len(qvec) != current_dim or all(e == 0.0 for e in qvec):
+            return f"RAG disabled: Could not generate a valid {current_dim}-dimension embedding vector using Cloudflare BGE-M3."
+
+        # 2. جستجوی اولیه در Supabase برای بازیابی TOP_K_RETRIEVAL چانک
+        res = supabase.rpc(
+            "match_site_pages",
+            {"query_embedding": qvec, "match_count": match_count}
+        ).execute()
+
+        if not res.data:
+            return "No relevant documentation found."
+        
+        initial_chunks = res.data
+        
+        # 3. 🚨 اعمال CUSTOM RERANKING بر روی چانک‌های بازیابی شده
+        final_ranked_chunks = custom_rerank_with_gemini(query, initial_chunks, TOP_K_RERANK) 
+        
+        # 4. ساخت Context نهایی
+        chunks = []
+        for i, row in enumerate(final_ranked_chunks):
+            similarity = row.get("similarity", "N/A")
+            
+            # 🚨 نمایش اینکه این رتبه توسط Gemini داده شده است
+            rerank_info = f"Rank: {i+1} (Gemini)" 
+            
+            source_info = row.get("url", "local").split('//')[-1].split('/')[0]
+            title = row.get("title", "Untitled")
+            content = row.get("content", "")
+            
+            chunks.append(f"--- Chunk {i+1} (Title: {title}, Source: {source_info}, Info: {rerank_info}, Sim: {similarity:.3f}) ---\n{content}")
+            
+        return "\n\n".join(chunks)
+        
+    except Exception as e:
+        return f"RAG error: {e}"
+
+
+def generate_rag_response(user_query: str, history: List[Dict[str, str]], context: str) -> str:
+    # ... (منطق تولید پاسخ با Gemini بدون تغییر) ...
+    if gemini_service is None:
+        return "LLM service is not initialized."
+        
+    is_rag_active_and_valid = not context.startswith("RAG disabled:") and not context.startswith("RAG error:")
+    is_context_useful = is_rag_active_and_valid and len(context.strip()) > 50
+
+    base_sys_prompt = (
+        "شما یک دستیار RAG متخصص و مسلط به زبان فارسی هستید. "
+        "هدف اصلی شما تولید پاسخ‌های کامل، دقیق و ساختاریافته بر اساس مستندات ارائه شده است."
+        "\n\n--- قوانین تولید پاسخ ---\n"
+        "1. **لحن:** همیشه پاسخی دوستانه، آگاهانه و در عین حال حرفه‌ای ارائه دهید."
+        "2. **ساختاردهی:** پاسخ‌ها را با استفاده از **بولِت پوینت‌ها** یا **سرفصل‌های Markdown (##)** ساختاردهی کنید تا خوانایی به حداکثر برسد. "
+        "3. **عدم تکرار:** از تکرار مستقیم جملات موجود در Context خودداری کنید؛ اطلاعات را ترکیب کرده و بازنویسی کنید."
+        "4. **تاریخچه:** همیشه به تاریخچه‌ی مکالمه توجه کنید تا بتوانید به سؤالات دنباله‌دار (Follow-up) پاسخ دهید."
+        "5. **اولویت:** ابتدا به سؤال اصلی کاربر پاسخ دهید، سپس جزئیات مرتبط را اضافه کنید."
+    )
+
+    if is_context_useful:
+        sys_prompt = (
+            f"{base_sys_prompt} هدف اصلی شما پاسخ به سؤال کاربر بر اساس **تنها** 'RAG CONTEXT' ارائه شده است. "
+            "شما **باید** پاسخ خود را با عبارت: '**بر اساس منبع دانش،**' شروع کنید اگر پاسخ را در Context پیدا کردید. "
+            "اگر Context پاسخ را ندارد، باید به وضوح بیان کنید: 'متأسفانه، منبع دانش من شامل اطلاعات لازم برای پاسخ به این سؤال نیست.' "
+            "از دانش عمومی خود استفاده نکنید مگر اینکه Context به وضوح اطلاعات نامرتبتی ارائه دهد یا خالی باشد."
+            "\n\n--- RAG CONTEXT ---\n"
+            f"{context}\n---"
+        )
+    else:
+        sys_prompt = (
+            f"{base_sys_prompt} 'RAG CONTEXT' کافی یا مرتبطی یافت نشد. "
+            "شما باید سؤال کاربر را با استفاده از **دانش عمومی** و **تاریخچه مکالمه** خود پاسخ دهید. "
+            "چون RAG فعال نیست، **هیچ اشاره‌ای** به منبع دانش (مانند 'بر اساس منبع دانش') یا Context در پاسخ خود نکنید. "
+            "فقط مستقیماً به سؤال کاربر پاسخ دهید."
+        )
+
+    response_text = gemini_service.generate(sys_prompt, history, user_query)
+    
+    return response_text
+
+
+# ---------------- STREAMLIT APP ----------------
+def main_streamlit_app():
+    
+    st.title(" 📚 Custom Gemini Rerank Chatbot ")
+    
+    if cloudflare_embed_service and gemini_service:
+        st.info(f"💡 **وضعیت:** حافظه مکالمه‌ای فعال، **Embedding:** {EMBED_MODEL} ({cloudflare_embed_service.dim} Dim), **Reranking:** {RERANK_MODEL} (Retrieval: {TOP_K_RETRIEVAL} -> Final: **{TOP_K_RERANK}**).", icon="🧠")
+    else:
+         st.warning("⚠️ RAG (Embedding/LLM) غیرفعال است (خطای API/تنظیمات).")
+         
+    if "messages" not in st.session_state:
+        st.session_state["messages"] = [
+            {"role": "assistant", "content": "سلام، من یک دستیار RAG هستم. لطفاً سؤال خود را بپرسید.", "timestamp": datetime.now().isoformat()} 
+        ]
+    
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            
+            if "timestamp" in msg:
+                try:
+                    dt_obj = datetime.fromisoformat(msg["timestamp"])
+                    time_str = dt_obj.strftime("%Y/%m/%d - %H:%M:%S")
+                    alignment = "right" if msg["role"] == "user" else "left"
+                    st.markdown(f'<p style="color: grey; font-size: small; text-align: {alignment}; margin-bottom: 0px;">{time_str}</p>', unsafe_allow_html=True)
+                except ValueError:
+                    st.markdown('<p style="color: red; font-size: small;">زمان نامعتبر</p>', unsafe_allow_html=True)
+
+
+    if prompt := st.chat_input("سؤال خود را اینجا بنویسید..."):
+        current_time = datetime.now().isoformat()
+        
+        st.session_state.messages.append({"role": "user", "content": prompt, "timestamp": current_time})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+            dt_obj = datetime.fromisoformat(current_time)
+            time_str = dt_obj.strftime("%Y/%m/%d - %H:%M:%S")
+            st.markdown(f'<p style="color: grey; font-size: small; text-align: right; margin-bottom: 0px;">{time_str}</p>', unsafe_allow_html=True)
+
+
+        with st.chat_message("assistant"):
+            response_placeholder = st.empty() 
+            
+            with st.spinner("⏳ در حال بازیابی دانش و تولید پاسخ..."):
+                
+                # 1. بازیابی Context (شامل 5 چانک مرتب شده)
+                rag_context = retrieve_rag_context(prompt) 
+                
+                # 2. تولید پاسخ با Context کامل
+                response = generate_rag_response(prompt, st.session_state.messages, rag_context)
+
+                response_placeholder.markdown(response)
+                
+                assistant_time = datetime.now().isoformat()
+                
+                st.session_state.messages.append({"role": "assistant", "content": response, "timestamp": assistant_time})
+                
+                dt_obj = datetime.fromisoformat(assistant_time)
+                time_str = dt_obj.strftime("%Y/%m/%d - %H:%M:%S")
+                st.markdown(f'<p style="color: grey; font-size: small; text-align: left; margin-bottom: 0px;">{time_str}</p>', unsafe_allow_html=True)
+
+
+                with st.expander("📝 جزئیات پردازش و منبع دانش"):
+                    
+                    is_rag_active_and_valid = not rag_context.startswith("RAG disabled:") and not rag_context.startswith("RAG error:")
+                    
+                    st.markdown(f"**مدل LLM:** `{GEMINI_MODEL}`")
+                    st.markdown(f"**مدل Embedding:** `{EMBED_MODEL}` (Dim: {cloudflare_embed_service.dim if cloudflare_embed_service else 'N/A'})")
+                    st.markdown(f"**مدل Reranker:** `{RERANK_MODEL}`")
+                    st.markdown(f"**بازیابی اولیه (Similarity):** {TOP_K_RETRIEVAL} چانک | **بازیابی نهایی (Rerank):** **{TOP_K_RERANK}** چانک")
+                    st.markdown("---")
+                    
+                    if "**بر اساس منبع دانش،**" in response and is_rag_active_and_valid:
+                        st.info("✅ **وضعیت Agent:** Agent از منبع دانش استفاده کرده و پاسخ را تولید کرده است.", icon="📚")
+                    elif is_rag_active_and_valid and "No relevant documentation found." in rag_context:
+                        st.warning("⚠️ **وضعیت Agent:** Context بازیابی شد، اما هیچ سند مرتبطی در دیتابیس پیدا نشد. Agent از دانش عمومی استفاده کرد.")
+                    elif is_rag_active_and_valid:
+                        st.warning("⚠️ **وضعیت Agent:** منبع دانش بازیابی شد، اما Agent تصمیم گرفت از آن استفاده نکند. (یا Context کافی نبود)")
+                    else:
+                        error_message = rag_context.split(': ', 1)[-1]
+                        st.error(f"❌ **وضعیت Agent:** بازیابی منبع دانش ناموفق بود. \n\n**دلیل:** {error_message}", icon="🚨")
+                    
+                    st.markdown("---")
+                    st.markdown(f"**تعداد پیام‌های در حافظه (Memory):** `{len(st.session_state.messages)}`")
+                    
+                    if rag_context and is_rag_active_and_valid:
+                        # نمایش چانک برتر
+                        start_index = rag_context.find("--- Chunk 1 ")
+                        end_index_2 = rag_context.find("--- Chunk 2 ", start_index)
+                        
+                        if start_index != -1: 
+                            if end_index_2 == -1:
+                                display_chunk = rag_context[start_index:].strip()
+                            else:
+                                display_chunk = rag_context[start_index:end_index_2].strip()
+
+                            st.text_area("📄 **مرتبط‌ترین منبع (Context):**", display_chunk, height=300)
+                            st.text_area("✨ **Context کامل (5 چانک) ارسالی به Gemini**", rag_context, height=100, help="این متنی است که Gemini برای تولید پاسخ شما از آن استفاده کرده است.")
+                        else:
+                            st.text_area("✨ **Context کامل (5 چانک) ارسالی به Gemini**", rag_context, height=100)
+                    else:
+                        st.markdown("**Context مرتبطی برای نمایش یافت نشد.**")
+
+if __name__ == "__main__":
+    if 'cloudflare_embed_service' not in globals() or cloudflare_embed_service is None or gemini_service is None:
+        cloudflare_embed_service, gemini_service = get_clients() 
+    
+    main_streamlit_app()
